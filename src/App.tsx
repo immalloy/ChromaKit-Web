@@ -464,6 +464,8 @@ function App() {
   const prepareFolderInputRef = useRef<HTMLInputElement>(null);
   const importInputRef = useRef<HTMLInputElement>(null);
   const [activeTab, setActiveTab] = useState<"generate" | "prepare">("generate");
+  const [generatePanel, setGeneratePanel] = useState<"source" | "pitch" | "processing">("source");
+  const [preparePanel, setPreparePanel] = useState<"source" | "silence">("source");
   const [settings, setSettings] = useState<Settings>(initialSettings);
   const [prepareSettings, setPrepareSettings] = useState<PrepareSettings>(initialPrepareSettings);
   const [files, setFiles] = useState<File[]>([]);
@@ -882,6 +884,23 @@ function App() {
 
       {activeTab === "generate" ? (
       <section className="workspace" aria-label="Generate chromatic scale">
+        <div className="settings-tabs" role="tablist" aria-label="Generate settings">
+          <button className={`settings-tab ${generatePanel === "source" ? "active" : ""}`} type="button" onClick={() => setGeneratePanel("source")}>
+            Source
+          </button>
+          <button className={`settings-tab ${generatePanel === "pitch" ? "active" : ""}`} type="button" onClick={() => setGeneratePanel("pitch")}>
+            Pitch / Range
+          </button>
+          <button
+            className={`settings-tab ${generatePanel === "processing" ? "active" : ""}`}
+            type="button"
+            onClick={() => setGeneratePanel("processing")}
+          >
+            Processing
+          </button>
+        </div>
+
+        {generatePanel === "source" ? (
         <aside className="panel source-panel">
           <div className="panel-title">
             <FileAudio size={18} />
@@ -927,13 +946,16 @@ function App() {
             {sourceFiles.length > 12 ? <p className="overflow-note">+{sourceFiles.length - 12} more files</p> : null}
           </div>
         </aside>
+        ) : null}
 
+        {generatePanel !== "source" ? (
         <section className="panel controls-panel">
           <div className="panel-title">
             <AudioLines size={18} />
-            <h2>Generate</h2>
+            <h2>{generatePanel === "pitch" ? "Pitch and Range" : "Processing"}</h2>
           </div>
 
+          {generatePanel === "pitch" ? (
           <div className="control-grid">
             <label>
               <span>Start note</span>
@@ -989,6 +1011,10 @@ function App() {
                 ))}
               </select>
             </label>
+          </div>
+          ) : (
+          <>
+          <div className="control-grid">
 
             <label>
               <span>Output rate</span>
@@ -1059,7 +1085,10 @@ function App() {
               {error}
             </div>
           ) : null}
+          </>
+          )}
         </section>
+        ) : null}
 
         <aside className="panel output-panel">
           <div className="panel-title">
@@ -1101,6 +1130,16 @@ function App() {
       </section>
       ) : (
       <section className="workspace" aria-label="Prepare samples">
+        <div className="settings-tabs" role="tablist" aria-label="Prepare settings">
+          <button className={`settings-tab ${preparePanel === "source" ? "active" : ""}`} type="button" onClick={() => setPreparePanel("source")}>
+            Source
+          </button>
+          <button className={`settings-tab ${preparePanel === "silence" ? "active" : ""}`} type="button" onClick={() => setPreparePanel("silence")}>
+            Silence
+          </button>
+        </div>
+
+        {preparePanel === "source" ? (
         <aside className="panel source-panel">
           <div className="panel-title">
             <FileAudio size={18} />
@@ -1146,7 +1185,9 @@ function App() {
             {prepareSourceFiles.length > 12 ? <p className="overflow-note">+{prepareSourceFiles.length - 12} more files</p> : null}
           </div>
         </aside>
+        ) : null}
 
+        {preparePanel === "silence" ? (
         <section className="panel controls-panel">
           <div className="panel-title">
             <AudioLines size={18} />
@@ -1224,6 +1265,7 @@ function App() {
             </div>
           ) : null}
         </section>
+        ) : null}
 
         <aside className="panel output-panel">
           <div className="panel-title">
