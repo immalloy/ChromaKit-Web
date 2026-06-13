@@ -77,7 +77,8 @@ select {
 }
 
 .brand-mark {
-  width: 46px;
+  display: block;
+  width: 178px;
   height: 46px;
   object-fit: contain;
 }
@@ -181,12 +182,14 @@ h1 span:last-child {
   grid-column: 1 / -1;
   display: grid;
   grid-template-columns: 360px minmax(0, 1fr);
-  gap: 14px;
+  grid-template-rows: auto minmax(0, 1fr);
+  gap: 10px 14px;
   min-height: 0;
 }
 
 .settings-tabs {
-  grid-column: 1;
+  grid-column: 1 / -1;
+  grid-row: 1;
   display: flex;
   align-items: end;
   min-height: 28px;
@@ -227,6 +230,7 @@ h1 span:last-child {
 .source-panel,
 .controls-panel {
   grid-column: 1;
+  grid-row: 2;
 }
 
 .source-panel {
@@ -239,7 +243,7 @@ h1 span:last-child {
 
 .output-panel {
   grid-column: 2;
-  grid-row: 1 / span 2;
+  grid-row: 2;
   display: flex;
   flex-direction: column;
   min-height: 560px;
@@ -568,6 +572,10 @@ h1 span:last-child {
   .output-panel {
     grid-column: 1;
     grid-row: auto;
+  }
+
+  .settings-tabs {
+    grid-column: 1;
   }
 }
 

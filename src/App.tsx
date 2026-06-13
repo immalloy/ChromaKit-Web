@@ -844,8 +844,8 @@ function App() {
       <section className="app-window">
         <header className="window-header">
           <div className="brand-lockup">
-            <img src="/chromakit-app-icon.png" alt="" className="brand-mark" />
-            <h1>
+            <img src="/chromakit-logo.png" alt="ChromaKit" className="brand-mark" />
+            <h1 className="visually-hidden">
               <span>Chroma</span>
               <span>Kit</span>
             </h1>
