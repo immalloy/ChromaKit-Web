@@ -539,8 +539,9 @@ h1 span:last-child {
 }
 
 .log-box {
-  flex: 1;
-  min-height: 400px;
+  flex: 0 0 auto;
+  min-height: 74px;
+  max-height: 110px;
   margin-top: 8px;
   padding: 8px;
   overflow: auto;
@@ -552,10 +553,11 @@ h1 span:last-child {
 }
 
 .log-box p {
-  margin-bottom: 3px;
+  margin-bottom: 0;
   color: #253041;
   font-size: 12px;
   line-height: 1.35;
+  overflow-wrap: anywhere;
 }
 
 @media (max-width: 900px) {

@@ -512,7 +512,7 @@ function App() {
     setError("");
     setChromatic(null);
     setDumpedSamples([]);
-    setLogs(selected.length ? [`Loaded ${selected.length} file(s).`] : []);
+    setLogs(selected.length ? [`Loaded ${listSourceFiles(selected).length} usable WAV file(s).`] : []);
   }
 
   function handleFolderFiles(event: ChangeEvent<HTMLInputElement>) {
@@ -525,7 +525,7 @@ function App() {
     setError("");
     setChromatic(null);
     setDumpedSamples([]);
-    setLogs(selected.length ? [`Loaded folder: ${folderName}`, `Found ${listSourceFiles(selected).length} usable WAV file(s).`] : []);
+    setLogs(selected.length ? [`Loaded ${listSourceFiles(selected).length} usable WAV file(s) from ${folderName}.`] : []);
   }
 
   async function readDirectoryFiles(handle: FileSystemDirectoryHandle) {
@@ -549,7 +549,7 @@ function App() {
         setError("");
         setChromatic(null);
         setDumpedSamples([]);
-        setLogs([`Loaded folder: ${handle.name}`, `Found ${listSourceFiles(selected).length} usable WAV file(s).`]);
+        setLogs([`Loaded ${listSourceFiles(selected).length} usable WAV file(s) from ${handle.name}.`]);
         return;
       } catch (caught) {
         if (caught instanceof DOMException && caught.name === "AbortError") return;
@@ -567,7 +567,11 @@ function App() {
     setPrepareDirectoryHandle(null);
     setPreparedDownloads([]);
     setPrepareError("");
-    setPrepareLogs(selected.length ? [`Loaded ${selected.length} file(s).`] : []);
+    setPrepareLogs(
+      selected.length
+        ? [`Loaded ${selected.filter((file) => file.name.toLowerCase().endsWith(".wav") && file.name.toLowerCase() !== "chromatic.wav").length} usable WAV file(s).`]
+        : [],
+    );
   }
 
   function handlePrepareFolderFiles(event: ChangeEvent<HTMLInputElement>) {
@@ -579,7 +583,7 @@ function App() {
     setPrepareDirectoryHandle(null);
     setPreparedDownloads([]);
     setPrepareError("");
-    setPrepareLogs(selected.length ? [`Loaded folder: ${folderName}`] : []);
+    setPrepareLogs(selected.length ? [`Loaded ${selected.filter((file) => file.name.toLowerCase().endsWith(".wav") && file.name.toLowerCase() !== "chromatic.wav").length} usable WAV file(s) from ${folderName}.`] : []);
   }
 
   async function choosePrepareFolder() {
@@ -592,7 +596,7 @@ function App() {
         setPrepareDirectoryHandle(handle);
         setPreparedDownloads([]);
         setPrepareError("");
-        setPrepareLogs([`Loaded folder: ${handle.name}`]);
+        setPrepareLogs([`Loaded ${selected.filter((file) => file.name.toLowerCase().endsWith(".wav") && file.name.toLowerCase() !== "chromatic.wav").length} usable WAV file(s) from ${handle.name}.`]);
         return;
       } catch (caught) {
         if (caught instanceof DOMException && caught.name === "AbortError") return;
@@ -628,8 +632,8 @@ function App() {
       if (data.prepare) setPrepareSettings((current) => ({ ...current, ...data.prepare }));
       setError("");
       setPrepareError("");
-      setLogs((current) => [...current, "Imported options."]);
-      setPrepareLogs((current) => [...current, "Imported options."]);
+      setLogs(["Imported options."]);
+      setPrepareLogs(["Imported options."]);
     } catch (caught) {
       const message = caught instanceof Error ? caught.message : "Could not import options.";
       setError(message);
@@ -665,15 +669,7 @@ function App() {
     setProgress({ done: 0, total: settings.semitones, label: "Starting" });
 
     try {
-      const addLog = (message: string) => setLogs((current) => [...current, message]);
-      addLog(`Found ${sourceFiles.length} source WAV file(s).`);
-      addLog(
-        `Semitones: ${settings.semitones} | Gap: ${settings.gapSeconds.toFixed(3)}s | ` +
-          `Order: ${settings.orderMode} | Style: ${settings.audioStyle} | Output: ${settings.outputSampleRate} Hz`,
-      );
-      if (settings.pitchSamples) {
-        addLog("Pitch mode uses browser-side pitch estimation. Desktop ChromaKit still has the more exact Praat retune.");
-      }
+      setLogs([`Generating 0/${settings.semitones} notes...`]);
 
       const indexes = orderedSampleIndexes(sourceFiles.length, settings.semitones, settings.orderMode);
       const renderedNotes: MonoSound[] = [];
@@ -685,28 +681,23 @@ function App() {
       for (let offset = 0; offset < indexes.length; offset += 1) {
         const file = sourceFiles[indexes[offset]];
         const label = noteLabel(settings.startNoteIndex, settings.startOctave, offset);
-        addLog(`[${offset + 1}/${settings.semitones}] Loading ${file.name} -> ${label}`);
+        setLogs([`Generating ${offset + 1}/${settings.semitones}: ${file.name} -> ${label}`]);
 
         let sound = await decodeWav(file, DEFAULT_SAMPLE_RATE);
         if (settings.trimSilence) {
           sound = trimEdgeSilence(sound);
-          addLog("  trimmed silence");
         }
         if (settings.normalize) {
           sound = peakNormalize(sound);
-          addLog("  normalized");
         }
         if (settings.pitchSamples) {
           sound = retuneSound(sound, noteFrequency(settings.startNoteIndex, settings.startOctave, offset), settings.audioStyle);
-          addLog(`  pitched (${settings.audioStyle})`);
         }
         if (settings.fadeMs > 0) {
           sound = applyFade(sound, settings.fadeMs);
-          addLog(`  fade ${settings.fadeMs} ms`);
         }
         if (settings.fixedNoteLength > 0) {
           sound = padOrTrim(sound, settings.fixedNoteLength, DEFAULT_SAMPLE_RATE);
-          addLog(`  fixed length ${settings.fixedNoteLength.toFixed(3)}s`);
         }
 
         sound = resampleIfNeeded(sound, settings.outputSampleRate);
@@ -741,7 +732,7 @@ function App() {
         const writable = await outputHandle.createWritable();
         await writable.write(blob);
         await writable.close();
-        addLog(`Saved to folder: ${sourceName || directoryHandle.name}/chromatic.wav`);
+        setLogs([`Done: saved chromatic.wav to ${sourceName || directoryHandle.name}.`]);
 
         if (settings.dumpSamples && sampleDownloads.length > 0) {
           const dumpDirectory = await directoryHandle.getDirectoryHandle(settings.pitchSamples ? "pitched_samples" : "samples", { create: true });
@@ -754,16 +745,16 @@ function App() {
             await sampleWritable.write(sampleBlob);
             await sampleWritable.close();
           }
-          addLog(`Saved ${sampleDownloads.length} dumped sample(s) to ${settings.pitchSamples ? "pitched_samples" : "samples"}.`);
+          setLogs([`Done: saved chromatic.wav and ${sampleDownloads.length} dumped sample(s).`]);
         }
       } else {
-        addLog("Saved: chromatic.wav is ready to download.");
+        setLogs(["Done: chromatic.wav is ready to download."]);
       }
       setProgress({ done: settings.semitones, total: settings.semitones, label: "Done" });
     } catch (caught) {
       const message = caught instanceof Error ? caught.message : "Generation failed.";
       setError(message);
-      setLogs((current) => [...current, `Error: ${message}`]);
+      setLogs([`Error: ${message}`]);
     } finally {
       setIsGenerating(false);
     }
@@ -777,7 +768,7 @@ function App() {
     setPrepareProgress({ done: 0, total: prepareSourceFiles.length, label: "Starting" });
 
     try {
-      const addLog = (message: string) => setPrepareLogs((current) => [...current, message]);
+      setPrepareLogs([`Preparing 0/${prepareSourceFiles.length} file(s)...`]);
       const prepared: GeneratedFile[] = [];
       let outputIndex = 1;
       let outputDirectory: FileSystemDirectoryHandle | null = null;
@@ -788,12 +779,12 @@ function App() {
 
       for (let fileIndex = 0; fileIndex < prepareSourceFiles.length; fileIndex += 1) {
         const file = prepareSourceFiles[fileIndex];
-        addLog(`[${fileIndex + 1}/${prepareSourceFiles.length}] Scanning ${file.name}`);
+        setPrepareLogs([`Preparing ${fileIndex + 1}/${prepareSourceFiles.length}: scanning ${file.name}`]);
         const sound = await decodeWav(file, prepareSettings.outputSampleRate);
         const regions = findAudioRegions(sound, prepareSettings);
 
         if (regions.length === 0) {
-          addLog("  no regions found");
+          setPrepareLogs([`Preparing ${fileIndex + 1}/${prepareSourceFiles.length}: no regions in ${file.name}`]);
           setPrepareProgress({ done: fileIndex + 1, total: prepareSourceFiles.length, label: file.name });
           continue;
         }
@@ -811,7 +802,7 @@ function App() {
             await writable.close();
           }
 
-          addLog(`  wrote ${name}`);
+          setPrepareLogs([`Preparing ${fileIndex + 1}/${prepareSourceFiles.length}: wrote ${name}`]);
           outputIndex += 1;
         }
 
@@ -824,16 +815,14 @@ function App() {
       }
 
       setPreparedDownloads(prepared);
-      addLog(
-        outputDirectory
-          ? `Prepared ${prepared.length} sample(s) in: prepared_samples`
-          : `Prepared ${prepared.length} sample(s). Use the download links below.`,
-      );
+      setPrepareLogs([
+        outputDirectory ? `Done: prepared ${prepared.length} sample(s) in prepared_samples.` : `Done: prepared ${prepared.length} sample(s).`,
+      ]);
       setPrepareProgress({ done: prepareSourceFiles.length, total: prepareSourceFiles.length, label: "Done" });
     } catch (caught) {
       const message = caught instanceof Error ? caught.message : "Preparation failed.";
       setPrepareError(message);
-      setPrepareLogs((current) => [...current, `Error: ${message}`]);
+      setPrepareLogs([`Error: ${message}`]);
     } finally {
       setIsPreparing(false);
     }
