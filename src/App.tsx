@@ -3,14 +3,10 @@ import {
   Check,
   Download,
   FileAudio,
-  Gauge,
-  Info,
   Loader2,
   Music2,
   RefreshCcw,
-  SlidersHorizontal,
   Sparkles,
-  Upload,
   X,
 } from "lucide-react";
 import { ChangeEvent, useMemo, useRef, useState } from "react";
@@ -19,9 +15,11 @@ const NOTES = ["C", "C#", "D", "D#", "E", "F", "F#", "G", "G#", "A", "A#", "B"];
 const OCTAVES = ["0", "1", "2", "3", "4", "5", "6", "7", "8"];
 const SAMPLE_RATES = [48000, 44100];
 const ORDER_MODES = ["sequential", "shuffle", "random"] as const;
+const AUDIO_STYLES = ["Current", "OG App", "Praat"] as const;
 const DEFAULT_SAMPLE_RATE = 48000;
 
 type OrderMode = (typeof ORDER_MODES)[number];
+type AudioStyle = (typeof AUDIO_STYLES)[number];
 
 type Settings = {
   startNoteIndex: number;
@@ -31,12 +29,21 @@ type Settings = {
   pitchSamples: boolean;
   dumpSamples: boolean;
   orderMode: OrderMode;
+  audioStyle: AudioStyle;
   trimSilence: boolean;
   normalize: boolean;
   fadeMs: number;
   fixedNoteLength: number;
   outputSampleRate: number;
   slicexMarkers: boolean;
+};
+
+type PrepareSettings = {
+  thresholdDb: number;
+  minRegionMs: number;
+  minSilenceMs: number;
+  paddingMs: number;
+  outputSampleRate: number;
 };
 
 type MonoSound = {
@@ -63,12 +70,27 @@ const initialSettings: Settings = {
   pitchSamples: true,
   dumpSamples: false,
   orderMode: "sequential",
+  audioStyle: "Current",
   trimSilence: true,
   normalize: true,
   fadeMs: 5,
   fixedNoteLength: 0,
   outputSampleRate: 48000,
   slicexMarkers: true,
+};
+
+const initialPrepareSettings: PrepareSettings = {
+  thresholdDb: -40,
+  minRegionMs: 80,
+  minSilenceMs: 120,
+  paddingMs: 20,
+  outputSampleRate: 48000,
+};
+
+type OptionsFile = {
+  version: 1;
+  generate: Settings;
+  prepare: PrepareSettings;
 };
 
 function noteLabel(startNoteIndex: number, startOctave: number, offset: number) {
@@ -192,6 +214,35 @@ function trimEdgeSilence(sound: MonoSound, thresholdDb = -40, paddingMs = 5): Mo
   return { sampleRate: sound.sampleRate, data: sound.data.slice(trimmedStart, trimmedEnd) };
 }
 
+function findAudioRegions(sound: MonoSound, settings: PrepareSettings) {
+  const threshold = dbToAmplitude(settings.thresholdDb);
+  const minRegion = Math.max(1, Math.round((settings.minRegionMs * sound.sampleRate) / 1000));
+  const minSilence = Math.max(1, Math.round((settings.minSilenceMs * sound.sampleRate) / 1000));
+  const padding = Math.max(0, Math.round((settings.paddingMs * sound.sampleRate) / 1000));
+  const regions: Array<[number, number]> = [];
+  let start: number | null = null;
+  let lastActive: number | null = null;
+
+  for (let index = 0; index < sound.data.length; index += 1) {
+    if (Math.abs(sound.data[index]) >= threshold) {
+      if (start === null) start = index;
+      lastActive = index;
+    } else if (start !== null && lastActive !== null && index - lastActive >= minSilence) {
+      if (lastActive - start + 1 >= minRegion) {
+        regions.push([Math.max(0, start - padding), Math.min(sound.data.length, lastActive + 1 + padding)]);
+      }
+      start = null;
+      lastActive = null;
+    }
+  }
+
+  if (start !== null && lastActive !== null && lastActive - start + 1 >= minRegion) {
+    regions.push([Math.max(0, start - padding), Math.min(sound.data.length, lastActive + 1 + padding)]);
+  }
+
+  return regions;
+}
+
 function peakNormalize(sound: MonoSound, targetPeak = 0.98): MonoSound {
   let peak = 0;
   for (const value of sound.data) peak = Math.max(peak, Math.abs(value));
@@ -267,7 +318,7 @@ function estimatePitch(sound: MonoSound): number | null {
   return sampleRate / bestLag;
 }
 
-function retuneSound(sound: MonoSound, targetFrequency: number): MonoSound {
+function retuneSound(sound: MonoSound, targetFrequency: number, audioStyle: AudioStyle): MonoSound {
   const currentFrequency = estimatePitch(sound);
   if (!currentFrequency || !Number.isFinite(currentFrequency)) return sound;
 
@@ -276,11 +327,12 @@ function retuneSound(sound: MonoSound, targetFrequency: number): MonoSound {
     return sound;
   }
 
-  const targetLength = Math.max(1, Math.round(sound.data.length / ratio));
+  const styleRatio = audioStyle === "OG App" ? ratio : ratio;
+  const targetLength = Math.max(1, Math.round(sound.data.length / styleRatio));
   const data = new Float32Array(targetLength);
 
   for (let index = 0; index < targetLength; index += 1) {
-    const sourceIndex = index * ratio;
+    const sourceIndex = index * styleRatio;
     const left = Math.floor(sourceIndex);
     const right = Math.min(sound.data.length - 1, left + 1);
     const amount = sourceIndex - left;
@@ -407,30 +459,182 @@ function formatBytes(bytes: number) {
 
 function App() {
   const fileInputRef = useRef<HTMLInputElement>(null);
+  const folderInputRef = useRef<HTMLInputElement>(null);
+  const prepareFilesInputRef = useRef<HTMLInputElement>(null);
+  const prepareFolderInputRef = useRef<HTMLInputElement>(null);
+  const importInputRef = useRef<HTMLInputElement>(null);
+  const [activeTab, setActiveTab] = useState<"generate" | "prepare">("generate");
   const [settings, setSettings] = useState<Settings>(initialSettings);
+  const [prepareSettings, setPrepareSettings] = useState<PrepareSettings>(initialPrepareSettings);
   const [files, setFiles] = useState<File[]>([]);
+  const [sourceName, setSourceName] = useState("");
+  const [directoryHandle, setDirectoryHandle] = useState<FileSystemDirectoryHandle | null>(null);
+  const [prepareFiles, setPrepareFiles] = useState<File[]>([]);
+  const [prepareSourceName, setPrepareSourceName] = useState("");
+  const [prepareDirectoryHandle, setPrepareDirectoryHandle] = useState<FileSystemDirectoryHandle | null>(null);
+  const [preparedDownloads, setPreparedDownloads] = useState<GeneratedFile[]>([]);
   const [logs, setLogs] = useState<string[]>([]);
+  const [prepareLogs, setPrepareLogs] = useState<string[]>([]);
   const [isGenerating, setIsGenerating] = useState(false);
+  const [isPreparing, setIsPreparing] = useState(false);
   const [progress, setProgress] = useState({ done: 0, total: 0, label: "Idle" });
+  const [prepareProgress, setPrepareProgress] = useState({ done: 0, total: 0, label: "Idle" });
   const [chromatic, setChromatic] = useState<GeneratedFile | null>(null);
   const [dumpedSamples, setDumpedSamples] = useState<GeneratedFile[]>([]);
   const [error, setError] = useState("");
+  const [prepareError, setPrepareError] = useState("");
 
   const sourceFiles = useMemo(() => listSourceFiles(files), [files]);
+  const prepareSourceFiles = useMemo(
+    () => prepareFiles.filter((file) => file.name.toLowerCase().endsWith(".wav") && file.name.toLowerCase() !== "chromatic.wav"),
+    [prepareFiles],
+  );
   const canGenerate = sourceFiles.length > 0 && !isGenerating;
+  const canPrepare = prepareSourceFiles.length > 0 && !isPreparing;
   const completion = progress.total > 0 ? Math.round((progress.done / progress.total) * 100) : 0;
+  const prepareCompletion = prepareProgress.total > 0 ? Math.round((prepareProgress.done / prepareProgress.total) * 100) : 0;
 
   function patchSettings(patch: Partial<Settings>) {
     setSettings((current) => ({ ...current, ...patch }));
   }
 
+  function patchPrepareSettings(patch: Partial<PrepareSettings>) {
+    setPrepareSettings((current) => ({ ...current, ...patch }));
+  }
+
   function handleFiles(event: ChangeEvent<HTMLInputElement>) {
     const selected = Array.from(event.currentTarget.files ?? []);
     setFiles(selected);
+    setSourceName(selected.length ? "Selected files" : "");
+    setDirectoryHandle(null);
     setError("");
     setChromatic(null);
     setDumpedSamples([]);
     setLogs(selected.length ? [`Loaded ${selected.length} file(s).`] : []);
+  }
+
+  function handleFolderFiles(event: ChangeEvent<HTMLInputElement>) {
+    const selected = Array.from(event.currentTarget.files ?? []);
+    const firstPath = selected[0]?.webkitRelativePath;
+    const folderName = firstPath ? firstPath.split("/")[0] : "Selected folder";
+    setFiles(selected);
+    setSourceName(selected.length ? folderName : "");
+    setDirectoryHandle(null);
+    setError("");
+    setChromatic(null);
+    setDumpedSamples([]);
+    setLogs(selected.length ? [`Loaded folder: ${folderName}`, `Found ${listSourceFiles(selected).length} usable WAV file(s).`] : []);
+  }
+
+  async function readDirectoryFiles(handle: FileSystemDirectoryHandle) {
+    const selected: File[] = [];
+    for await (const entry of handle.values()) {
+      if (entry.kind === "file" && entry.name.toLowerCase().endsWith(".wav")) {
+        selected.push(await entry.getFile());
+      }
+    }
+    return selected;
+  }
+
+  async function chooseFolder() {
+    if (window.showDirectoryPicker) {
+      try {
+        const handle = await window.showDirectoryPicker();
+        const selected = await readDirectoryFiles(handle);
+        setFiles(selected);
+        setSourceName(handle.name);
+        setDirectoryHandle(handle);
+        setError("");
+        setChromatic(null);
+        setDumpedSamples([]);
+        setLogs([`Loaded folder: ${handle.name}`, `Found ${listSourceFiles(selected).length} usable WAV file(s).`]);
+        return;
+      } catch (caught) {
+        if (caught instanceof DOMException && caught.name === "AbortError") return;
+        setError(caught instanceof Error ? caught.message : "Could not open folder.");
+      }
+    }
+
+    folderInputRef.current?.click();
+  }
+
+  function handlePrepareFiles(event: ChangeEvent<HTMLInputElement>) {
+    const selected = Array.from(event.currentTarget.files ?? []);
+    setPrepareFiles(selected);
+    setPrepareSourceName(selected.length === 1 ? selected[0].name : selected.length ? `${selected.length} WAV file(s)` : "");
+    setPrepareDirectoryHandle(null);
+    setPreparedDownloads([]);
+    setPrepareError("");
+    setPrepareLogs(selected.length ? [`Loaded ${selected.length} file(s).`] : []);
+  }
+
+  function handlePrepareFolderFiles(event: ChangeEvent<HTMLInputElement>) {
+    const selected = Array.from(event.currentTarget.files ?? []);
+    const firstPath = selected[0]?.webkitRelativePath;
+    const folderName = firstPath ? firstPath.split("/")[0] : "Selected folder";
+    setPrepareFiles(selected);
+    setPrepareSourceName(selected.length ? folderName : "");
+    setPrepareDirectoryHandle(null);
+    setPreparedDownloads([]);
+    setPrepareError("");
+    setPrepareLogs(selected.length ? [`Loaded folder: ${folderName}`] : []);
+  }
+
+  async function choosePrepareFolder() {
+    if (window.showDirectoryPicker) {
+      try {
+        const handle = await window.showDirectoryPicker();
+        const selected = await readDirectoryFiles(handle);
+        setPrepareFiles(selected);
+        setPrepareSourceName(handle.name);
+        setPrepareDirectoryHandle(handle);
+        setPreparedDownloads([]);
+        setPrepareError("");
+        setPrepareLogs([`Loaded folder: ${handle.name}`]);
+        return;
+      } catch (caught) {
+        if (caught instanceof DOMException && caught.name === "AbortError") return;
+        setPrepareError(caught instanceof Error ? caught.message : "Could not open folder.");
+      }
+    }
+
+    prepareFolderInputRef.current?.click();
+  }
+
+  function exportOptions() {
+    const options: OptionsFile = {
+      version: 1,
+      generate: settings,
+      prepare: prepareSettings,
+    };
+    const blob = new Blob([JSON.stringify(options, null, 2)], { type: "application/json" });
+    const url = URL.createObjectURL(blob);
+    const link = document.createElement("a");
+    link.href = url;
+    link.download = "chromakit-options.json";
+    link.click();
+    URL.revokeObjectURL(url);
+  }
+
+  async function importOptions(event: ChangeEvent<HTMLInputElement>) {
+    const file = event.currentTarget.files?.[0];
+    if (!file) return;
+
+    try {
+      const data = JSON.parse(await file.text()) as Partial<OptionsFile>;
+      if (data.generate) setSettings((current) => ({ ...current, ...data.generate }));
+      if (data.prepare) setPrepareSettings((current) => ({ ...current, ...data.prepare }));
+      setError("");
+      setPrepareError("");
+      setLogs((current) => [...current, "Imported options."]);
+      setPrepareLogs((current) => [...current, "Imported options."]);
+    } catch (caught) {
+      const message = caught instanceof Error ? caught.message : "Could not import options.";
+      setError(message);
+      setPrepareError(message);
+    } finally {
+      event.currentTarget.value = "";
+    }
   }
 
   function clearOutput() {
@@ -441,6 +645,14 @@ function App() {
     setLogs([]);
     setProgress({ done: 0, total: 0, label: "Idle" });
     setError("");
+  }
+
+  function clearPrepareOutput() {
+    for (const sample of preparedDownloads) URL.revokeObjectURL(sample.url);
+    setPreparedDownloads([]);
+    setPrepareLogs([]);
+    setPrepareProgress({ done: 0, total: 0, label: "Idle" });
+    setPrepareError("");
   }
 
   async function generate() {
@@ -455,7 +667,7 @@ function App() {
       addLog(`Found ${sourceFiles.length} source WAV file(s).`);
       addLog(
         `Semitones: ${settings.semitones} | Gap: ${settings.gapSeconds.toFixed(3)}s | ` +
-          `Order: ${settings.orderMode} | Output: ${settings.outputSampleRate} Hz`,
+          `Order: ${settings.orderMode} | Style: ${settings.audioStyle} | Output: ${settings.outputSampleRate} Hz`,
       );
       if (settings.pitchSamples) {
         addLog("Pitch mode uses browser-side pitch estimation. Desktop ChromaKit still has the more exact Praat retune.");
@@ -483,8 +695,8 @@ function App() {
           addLog("  normalized");
         }
         if (settings.pitchSamples) {
-          sound = retuneSound(sound, noteFrequency(settings.startNoteIndex, settings.startOctave, offset));
-          addLog("  pitched");
+          sound = retuneSound(sound, noteFrequency(settings.startNoteIndex, settings.startOctave, offset), settings.audioStyle);
+          addLog(`  pitched (${settings.audioStyle})`);
         }
         if (settings.fadeMs > 0) {
           sound = applyFade(sound, settings.fadeMs);
@@ -522,7 +734,29 @@ function App() {
       const blob = encodeWav(output, settings.slicexMarkers ? markers : []);
       setChromatic({ name: "chromatic.wav", url: URL.createObjectURL(blob), size: blob.size });
       setDumpedSamples(sampleDownloads);
-      addLog("Saved: chromatic.wav");
+      if (directoryHandle) {
+        const outputHandle = await directoryHandle.getFileHandle("chromatic.wav", { create: true });
+        const writable = await outputHandle.createWritable();
+        await writable.write(blob);
+        await writable.close();
+        addLog(`Saved to folder: ${sourceName || directoryHandle.name}/chromatic.wav`);
+
+        if (settings.dumpSamples && sampleDownloads.length > 0) {
+          const dumpDirectory = await directoryHandle.getDirectoryHandle(settings.pitchSamples ? "pitched_samples" : "samples", { create: true });
+          for (let index = 0; index < sampleDownloads.length; index += 1) {
+            const sample = sampleDownloads[index];
+            const response = await fetch(sample.url);
+            const sampleBlob = await response.blob();
+            const sampleHandle = await dumpDirectory.getFileHandle(`note_${index + 1}.wav`, { create: true });
+            const sampleWritable = await sampleHandle.createWritable();
+            await sampleWritable.write(sampleBlob);
+            await sampleWritable.close();
+          }
+          addLog(`Saved ${sampleDownloads.length} dumped sample(s) to ${settings.pitchSamples ? "pitched_samples" : "samples"}.`);
+        }
+      } else {
+        addLog("Saved: chromatic.wav is ready to download.");
+      }
       setProgress({ done: settings.semitones, total: settings.semitones, label: "Done" });
     } catch (caught) {
       const message = caught instanceof Error ? caught.message : "Generation failed.";
@@ -533,42 +767,149 @@ function App() {
     }
   }
 
+  async function prepareSamples() {
+    if (!canPrepare) return;
+
+    clearPrepareOutput();
+    setIsPreparing(true);
+    setPrepareProgress({ done: 0, total: prepareSourceFiles.length, label: "Starting" });
+
+    try {
+      const addLog = (message: string) => setPrepareLogs((current) => [...current, message]);
+      const prepared: GeneratedFile[] = [];
+      let outputIndex = 1;
+      let outputDirectory: FileSystemDirectoryHandle | null = null;
+
+      if (prepareDirectoryHandle) {
+        outputDirectory = await prepareDirectoryHandle.getDirectoryHandle("prepared_samples", { create: true });
+      }
+
+      for (let fileIndex = 0; fileIndex < prepareSourceFiles.length; fileIndex += 1) {
+        const file = prepareSourceFiles[fileIndex];
+        addLog(`[${fileIndex + 1}/${prepareSourceFiles.length}] Scanning ${file.name}`);
+        const sound = await decodeWav(file, prepareSettings.outputSampleRate);
+        const regions = findAudioRegions(sound, prepareSettings);
+
+        if (regions.length === 0) {
+          addLog("  no regions found");
+          setPrepareProgress({ done: fileIndex + 1, total: prepareSourceFiles.length, label: file.name });
+          continue;
+        }
+
+        for (const [start, end] of regions) {
+          const part = { sampleRate: sound.sampleRate, data: sound.data.slice(start, end) };
+          const blob = encodeWav(part);
+          const name = `${outputIndex}.wav`;
+          prepared.push({ name, url: URL.createObjectURL(blob), size: blob.size });
+
+          if (outputDirectory) {
+            const fileHandle = await outputDirectory.getFileHandle(name, { create: true });
+            const writable = await fileHandle.createWritable();
+            await writable.write(blob);
+            await writable.close();
+          }
+
+          addLog(`  wrote ${name}`);
+          outputIndex += 1;
+        }
+
+        setPrepareProgress({ done: fileIndex + 1, total: prepareSourceFiles.length, label: file.name });
+        await new Promise((resolve) => window.setTimeout(resolve, 0));
+      }
+
+      if (prepared.length === 0) {
+        throw new Error("No non-silent sample regions were found.");
+      }
+
+      setPreparedDownloads(prepared);
+      addLog(
+        outputDirectory
+          ? `Prepared ${prepared.length} sample(s) in: prepared_samples`
+          : `Prepared ${prepared.length} sample(s). Use the download links below.`,
+      );
+      setPrepareProgress({ done: prepareSourceFiles.length, total: prepareSourceFiles.length, label: "Done" });
+    } catch (caught) {
+      const message = caught instanceof Error ? caught.message : "Preparation failed.";
+      setPrepareError(message);
+      setPrepareLogs((current) => [...current, `Error: ${message}`]);
+    } finally {
+      setIsPreparing(false);
+    }
+  }
+
   return (
     <main className="app-shell">
-      <section className="hero-band">
-        <div className="hero-copy">
-          <img src="/chromakit-logo.png" alt="ChromaKit" className="brand-logo" />
-          <h1>ChromaKit Web</h1>
-          <p>
-            Generate chromatic WAV scales from browser-selected samples. No install, no upload server, just local audio
-            processing and an instant download.
-          </p>
-        </div>
-        <div className="hero-meter" aria-label="Generation progress">
-          <div className="meter-header">
-            <Gauge size={18} />
-            <span>{progress.label}</span>
+      <section className="app-window">
+        <header className="window-header">
+          <div className="brand-lockup">
+            <img src="/chromakit-app-icon.png" alt="" className="brand-mark" />
+            <h1>
+              <span>Chroma</span>
+              <span>Kit</span>
+            </h1>
           </div>
-          <div className="meter-value">{completion}%</div>
-          <div className="progress-track">
-            <span style={{ width: `${completion}%` }} />
+          <div className="header-tools">
+            <button className="tool-button text-tool" type="button" onClick={exportOptions}>
+              Export Options
+            </button>
+            <button className="tool-button text-tool" type="button" onClick={() => importInputRef.current?.click()}>
+              Import Options
+            </button>
+            <input ref={importInputRef} className="visually-hidden" type="file" accept="application/json,.json" onChange={importOptions} />
           </div>
-        </div>
-      </section>
+        </header>
 
+        <div className="top-tabs" role="tablist" aria-label="ChromaKit tools">
+          <button
+            className={`top-tab ${activeTab === "generate" ? "active" : ""}`}
+            type="button"
+            role="tab"
+            aria-selected={activeTab === "generate"}
+            onClick={() => setActiveTab("generate")}
+          >
+            Generate
+          </button>
+          <button
+            className={`top-tab ${activeTab === "prepare" ? "active" : ""}`}
+            type="button"
+            role="tab"
+            aria-selected={activeTab === "prepare"}
+            onClick={() => setActiveTab("prepare")}
+          >
+            Prepare Samples
+          </button>
+        </div>
+
+      {activeTab === "generate" ? (
       <section className="workspace" aria-label="Generate chromatic scale">
         <aside className="panel source-panel">
           <div className="panel-title">
-            <Upload size={18} />
+            <FileAudio size={18} />
             <h2>Source WAVs</h2>
           </div>
 
-          <button className="drop-zone" type="button" onClick={() => fileInputRef.current?.click()}>
-            <FileAudio size={28} />
-            <span>Choose WAV files</span>
-            <small>Numbered files like 1.wav, 2.wav are used first.</small>
-          </button>
+          <div className="source-field">
+            <FileAudio size={16} />
+            <span>{sourceName ? sourceName : "Choose WAV files or a folder"}</span>
+          </div>
           <input ref={fileInputRef} className="visually-hidden" type="file" accept=".wav,audio/wav" multiple onChange={handleFiles} />
+          <input
+            ref={folderInputRef}
+            className="visually-hidden"
+            type="file"
+            multiple
+            onChange={handleFolderFiles}
+            {...{ webkitdirectory: "", directory: "" }}
+          />
+
+          <div className="source-actions">
+            <button className="secondary-button" type="button" onClick={chooseFolder}>
+              Choose Folder
+            </button>
+            <button className="secondary-button" type="button" onClick={() => fileInputRef.current?.click()}>
+              Choose WAV Files
+            </button>
+          </div>
 
           <div className="source-summary">
             <strong>{sourceFiles.length}</strong>
@@ -593,7 +934,7 @@ function App() {
 
         <section className="panel controls-panel">
           <div className="panel-title">
-            <SlidersHorizontal size={18} />
+            <AudioLines size={18} />
             <h2>Generate</h2>
           </div>
 
@@ -665,6 +1006,17 @@ function App() {
             </label>
 
             <label>
+              <span>Audio style</span>
+              <select value={settings.audioStyle} onChange={(event) => patchSettings({ audioStyle: event.target.value as AudioStyle })}>
+                {AUDIO_STYLES.map((style) => (
+                  <option key={style} value={style}>
+                    {style}
+                  </option>
+                ))}
+              </select>
+            </label>
+
+            <label>
               <span>Fade ms</span>
               <input
                 type="number"
@@ -720,7 +1072,6 @@ function App() {
           </div>
 
           <div className="status-box">
-            <Info size={18} />
             <span>Browser pitch is approximate. Use desktop ChromaKit when exact Praat retuning is required.</span>
           </div>
 
@@ -756,6 +1107,187 @@ function App() {
           </div>
         </aside>
       </section>
+      ) : (
+      <section className="workspace" aria-label="Prepare samples">
+        <aside className="panel source-panel">
+          <div className="panel-title">
+            <FileAudio size={18} />
+            <h2>Source WAVs</h2>
+          </div>
+
+          <div className="source-field">
+            <FileAudio size={16} />
+            <span>{prepareSourceName ? prepareSourceName : "Choose WAV files or a folder to split by silence"}</span>
+          </div>
+          <input ref={prepareFilesInputRef} className="visually-hidden" type="file" accept=".wav,audio/wav" multiple onChange={handlePrepareFiles} />
+          <input
+            ref={prepareFolderInputRef}
+            className="visually-hidden"
+            type="file"
+            multiple
+            onChange={handlePrepareFolderFiles}
+            {...{ webkitdirectory: "", directory: "" }}
+          />
+
+          <div className="source-actions">
+            <button className="secondary-button" type="button" onClick={choosePrepareFolder}>
+              Choose Folder
+            </button>
+            <button className="secondary-button" type="button" onClick={() => prepareFilesInputRef.current?.click()}>
+              Choose WAV Files
+            </button>
+          </div>
+
+          <div className="source-summary">
+            <strong>{prepareSourceFiles.length}</strong>
+            <span>usable WAV file{prepareSourceFiles.length === 1 ? "" : "s"}</span>
+          </div>
+
+          <div className="file-list" aria-label="Selected prepare source files">
+            {prepareSourceFiles.length === 0 ? (
+              <p className="empty-state">No WAV files selected yet.</p>
+            ) : (
+              prepareSourceFiles.slice(0, 12).map((file) => (
+                <div className="file-row" key={`${file.name}-${file.size}`}>
+                  <Music2 size={16} />
+                  <span>{file.name}</span>
+                  <small>{formatBytes(file.size)}</small>
+                </div>
+              ))
+            )}
+            {prepareSourceFiles.length > 12 ? <p className="overflow-note">+{prepareSourceFiles.length - 12} more files</p> : null}
+          </div>
+        </aside>
+
+        <section className="panel controls-panel">
+          <div className="panel-title">
+            <AudioLines size={18} />
+            <h2>Silence Detection</h2>
+          </div>
+
+          <div className="control-grid">
+            <label>
+              <span>Silence threshold</span>
+              <input
+                type="number"
+                min={-90}
+                max={-1}
+                value={prepareSettings.thresholdDb}
+                onChange={(event) => patchPrepareSettings({ thresholdDb: Number(event.target.value) })}
+              />
+            </label>
+            <label>
+              <span>Minimum sample length</span>
+              <input
+                type="number"
+                min={1}
+                value={prepareSettings.minRegionMs}
+                onChange={(event) => patchPrepareSettings({ minRegionMs: Math.max(1, Number(event.target.value)) })}
+              />
+            </label>
+            <label>
+              <span>Minimum silence gap</span>
+              <input
+                type="number"
+                min={1}
+                value={prepareSettings.minSilenceMs}
+                onChange={(event) => patchPrepareSettings({ minSilenceMs: Math.max(1, Number(event.target.value)) })}
+              />
+            </label>
+            <label>
+              <span>Padding</span>
+              <input
+                type="number"
+                min={0}
+                value={prepareSettings.paddingMs}
+                onChange={(event) => patchPrepareSettings({ paddingMs: Math.max(0, Number(event.target.value)) })}
+              />
+            </label>
+            <label>
+              <span>Output sample rate</span>
+              <select
+                value={prepareSettings.outputSampleRate}
+                onChange={(event) => patchPrepareSettings({ outputSampleRate: Number(event.target.value) })}
+              >
+                {SAMPLE_RATES.map((rate) => (
+                  <option key={rate} value={rate}>
+                    {rate} Hz
+                  </option>
+                ))}
+              </select>
+            </label>
+          </div>
+
+          <div className="action-row">
+            <button className="primary-button" type="button" disabled={!canPrepare} onClick={prepareSamples}>
+              {isPreparing ? <Loader2 className="spin" size={18} /> : <Sparkles size={18} />}
+              Prepare Samples
+            </button>
+            <button className="secondary-button" type="button" onClick={clearPrepareOutput} disabled={isPreparing}>
+              <RefreshCcw size={18} />
+              Reset Output
+            </button>
+          </div>
+
+          {prepareError ? (
+            <div className="error-box" role="alert">
+              <X size={18} />
+              {prepareError}
+            </div>
+          ) : null}
+        </section>
+
+        <aside className="panel output-panel">
+          <div className="panel-title">
+            <AudioLines size={18} />
+            <h2>Output</h2>
+          </div>
+
+          <div className="progress-track" aria-label={`Preparation progress ${prepareCompletion}%`}>
+            <span style={{ width: `${prepareCompletion}%` }} />
+          </div>
+
+          {preparedDownloads.length > 0 ? (
+            <div className="sample-downloads visible-list">
+              <h3>Prepared samples</h3>
+              {preparedDownloads.map((sample) => (
+                <a key={sample.name} href={sample.url} download={sample.name}>
+                  {sample.name}
+                  <small>{formatBytes(sample.size)}</small>
+                </a>
+              ))}
+            </div>
+          ) : (
+            <div className="empty-output">
+              <Check size={18} />
+              <span>Prepared samples will appear here.</span>
+            </div>
+          )}
+
+          <div className="log-box" aria-live="polite">
+            {prepareLogs.length === 0 ? (
+              <p>Preparation logs will appear here.</p>
+            ) : (
+              prepareLogs.map((log, index) => <p key={`${log}-${index}`}>{log}</p>)
+            )}
+          </div>
+        </aside>
+      </section>
+      )}
+      <footer className="status-bar">
+        {activeTab === "generate" ? (
+          <>
+            <span>{isGenerating ? "Generating..." : chromatic ? "Done" : "Idle"}</span>
+            <span>{progress.label}</span>
+          </>
+        ) : (
+          <>
+            <span>{isPreparing ? "Preparing..." : preparedDownloads.length ? "Done" : "Idle"}</span>
+            <span>{prepareProgress.label}</span>
+          </>
+        )}
+      </footer>
+      </section>
     </main>
   );
 }
@@ -770,7 +1302,6 @@ function Toggle({ label, checked, onChange }: ToggleProps) {
   return (
     <label className="toggle">
       <input type="checkbox" checked={checked} onChange={(event) => onChange(event.target.checked)} />
-      <span className="switch" aria-hidden="true" />
       <span>{label}</span>
     </label>
   );
