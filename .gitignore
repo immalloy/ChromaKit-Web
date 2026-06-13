@@ -2,3 +2,6 @@
 /dist
 
 .vercel
+*.tsbuildinfo
+vite.config.js
+vite.config.d.ts
