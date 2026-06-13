@@ -888,10 +888,6 @@ function App() {
             <h2>Source WAVs</h2>
           </div>
 
-          <div className="source-field">
-            <FileAudio size={16} />
-            <span>{sourceName ? sourceName : "Choose WAV files or a folder"}</span>
-          </div>
           <input ref={fileInputRef} className="visually-hidden" type="file" accept=".wav,audio/wav" multiple onChange={handleFiles} />
           <input
             ref={folderInputRef}
@@ -1071,10 +1067,6 @@ function App() {
             <h2>Output</h2>
           </div>
 
-          <div className="status-box">
-            <span>Browser pitch is approximate. Use desktop ChromaKit when exact Praat retuning is required.</span>
-          </div>
-
           {chromatic ? (
             <a className="download-card" href={chromatic.url} download={chromatic.name}>
               <Download size={20} />
@@ -1115,10 +1107,6 @@ function App() {
             <h2>Source WAVs</h2>
           </div>
 
-          <div className="source-field">
-            <FileAudio size={16} />
-            <span>{prepareSourceName ? prepareSourceName : "Choose WAV files or a folder to split by silence"}</span>
-          </div>
           <input ref={prepareFilesInputRef} className="visually-hidden" type="file" accept=".wav,audio/wav" multiple onChange={handlePrepareFiles} />
           <input
             ref={prepareFolderInputRef}

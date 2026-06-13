@@ -240,35 +240,6 @@ h1 span:last-child {
   font-weight: 400;
 }
 
-.source-field {
-  width: 100%;
-  min-height: 36px;
-  display: flex;
-  align-items: center;
-  justify-content: flex-start;
-  gap: 8px;
-  padding: 6px 10px;
-  color: var(--text);
-  background: #ffffff;
-  border: 1px solid #b9c3cf;
-  border-radius: 3px;
-}
-
-.source-field svg {
-  width: 18px;
-  height: 18px;
-  flex: 0 0 auto;
-}
-
-.source-field span {
-  min-width: 0;
-  overflow: hidden;
-  text-overflow: ellipsis;
-  white-space: nowrap;
-  font-size: 13px;
-  font-weight: 500;
-}
-
 .visually-hidden {
   position: absolute;
   width: 1px;
@@ -471,20 +442,6 @@ h1 span:last-child {
   to {
     transform: rotate(360deg);
   }
-}
-
-.status-box {
-  margin-bottom: 8px;
-  padding: 6px 8px;
-  color: var(--muted);
-  background: #f4f6f8;
-  border: 1px solid #dce2ea;
-  border-radius: 3px;
-  font-size: 12px;
-}
-
-.status-box svg {
-  display: none;
 }
 
 .error-box,
