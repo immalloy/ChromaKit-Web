@@ -1,0 +1,779 @@
+import {
+  AudioLines,
+  Check,
+  Download,
+  FileAudio,
+  Gauge,
+  Info,
+  Loader2,
+  Music2,
+  RefreshCcw,
+  SlidersHorizontal,
+  Sparkles,
+  Upload,
+  X,
+} from "lucide-react";
+import { ChangeEvent, useMemo, useRef, useState } from "react";
+
+const NOTES = ["C", "C#", "D", "D#", "E", "F", "F#", "G", "G#", "A", "A#", "B"];
+const OCTAVES = ["0", "1", "2", "3", "4", "5", "6", "7", "8"];
+const SAMPLE_RATES = [48000, 44100];
+const ORDER_MODES = ["sequential", "shuffle", "random"] as const;
+const DEFAULT_SAMPLE_RATE = 48000;
+
+type OrderMode = (typeof ORDER_MODES)[number];
+
+type Settings = {
+  startNoteIndex: number;
+  startOctave: number;
+  semitones: number;
+  gapSeconds: number;
+  pitchSamples: boolean;
+  dumpSamples: boolean;
+  orderMode: OrderMode;
+  trimSilence: boolean;
+  normalize: boolean;
+  fadeMs: number;
+  fixedNoteLength: number;
+  outputSampleRate: number;
+  slicexMarkers: boolean;
+};
+
+type MonoSound = {
+  sampleRate: number;
+  data: Float32Array;
+};
+
+type SliceMarker = {
+  offset: number;
+  label: string;
+};
+
+type GeneratedFile = {
+  name: string;
+  url: string;
+  size: number;
+};
+
+const initialSettings: Settings = {
+  startNoteIndex: 0,
+  startOctave: 4,
+  semitones: 12,
+  gapSeconds: 0.05,
+  pitchSamples: true,
+  dumpSamples: false,
+  orderMode: "sequential",
+  trimSilence: true,
+  normalize: true,
+  fadeMs: 5,
+  fixedNoteLength: 0,
+  outputSampleRate: 48000,
+  slicexMarkers: true,
+};
+
+function noteLabel(startNoteIndex: number, startOctave: number, offset: number) {
+  const total = startNoteIndex + offset;
+  return `${NOTES[total % 12]}${startOctave + Math.floor(total / 12)}`;
+}
+
+function noteFrequency(startNoteIndex: number, startOctave: number, offset: number) {
+  const baseMidi = (startOctave + 1) * 12 + startNoteIndex;
+  const midiNote = baseMidi + offset;
+  return 440 * 2 ** ((midiNote - 69) / 12);
+}
+
+function dbToAmplitude(dbValue: number) {
+  return 10 ** (dbValue / 20);
+}
+
+function clampSample(value: number) {
+  return Math.max(-1, Math.min(1, value));
+}
+
+function listSourceFiles(files: File[]) {
+  const wavFiles = files
+    .filter((file) => file.name.toLowerCase().endsWith(".wav"))
+    .filter((file) => file.name.toLowerCase() !== "chromatic.wav");
+
+  const numbered = wavFiles
+    .map((file) => {
+      const match = file.name.match(/^(\d+)\.wav$/i);
+      return match ? { file, index: Number(match[1]) } : null;
+    })
+    .filter((entry): entry is { file: File; index: number } => Boolean(entry))
+    .sort((a, b) => a.index - b.index);
+
+  if (numbered.length > 0 && numbered[0].index === 1) {
+    const contiguous: File[] = [];
+    for (let expected = 1; expected <= numbered.length; expected += 1) {
+      const found = numbered.find((entry) => entry.index === expected);
+      if (!found) break;
+      contiguous.push(found.file);
+    }
+    if (contiguous.length > 0) return contiguous;
+  }
+
+  return wavFiles.sort((a, b) => a.name.localeCompare(b.name, undefined, { numeric: true }));
+}
+
+function orderedSampleIndexes(count: number, total: number, mode: OrderMode) {
+  if (mode === "random") {
+    return Array.from({ length: total }, () => Math.floor(Math.random() * count));
+  }
+
+  const order = Array.from({ length: count }, (_, index) => index);
+  if (mode === "shuffle") {
+    for (let index = order.length - 1; index > 0; index -= 1) {
+      const swap = Math.floor(Math.random() * (index + 1));
+      [order[index], order[swap]] = [order[swap], order[index]];
+    }
+  }
+
+  return Array.from({ length: total }, (_, index) => order[index % count]);
+}
+
+async function decodeWav(file: File, targetSampleRate = DEFAULT_SAMPLE_RATE): Promise<MonoSound> {
+  const AudioContextClass = window.AudioContext || window.webkitAudioContext;
+  const audioContext = new AudioContextClass({ sampleRate: targetSampleRate });
+  try {
+    const buffer = await audioContext.decodeAudioData(await file.arrayBuffer());
+    const mono = new Float32Array(buffer.length);
+
+    for (let channel = 0; channel < buffer.numberOfChannels; channel += 1) {
+      const values = buffer.getChannelData(channel);
+      for (let index = 0; index < values.length; index += 1) {
+        mono[index] += values[index] / buffer.numberOfChannels;
+      }
+    }
+
+    const sound = { sampleRate: buffer.sampleRate, data: mono };
+    return resampleIfNeeded(sound, targetSampleRate);
+  } finally {
+    await audioContext.close();
+  }
+}
+
+function resampleIfNeeded(sound: MonoSound, sampleRate: number): MonoSound {
+  if (sound.sampleRate === sampleRate) return sound;
+  const ratio = sampleRate / sound.sampleRate;
+  const length = Math.max(1, Math.round(sound.data.length * ratio));
+  const data = new Float32Array(length);
+
+  for (let index = 0; index < length; index += 1) {
+    const sourceIndex = index / ratio;
+    const left = Math.floor(sourceIndex);
+    const right = Math.min(sound.data.length - 1, left + 1);
+    const amount = sourceIndex - left;
+    data[index] = sound.data[left] * (1 - amount) + sound.data[right] * amount;
+  }
+
+  return { sampleRate, data };
+}
+
+function trimEdgeSilence(sound: MonoSound, thresholdDb = -40, paddingMs = 5): MonoSound {
+  const threshold = dbToAmplitude(thresholdDb);
+  let start = -1;
+  let end = -1;
+
+  for (let index = 0; index < sound.data.length; index += 1) {
+    if (Math.abs(sound.data[index]) >= threshold) {
+      if (start === -1) start = index;
+      end = index;
+    }
+  }
+
+  if (start === -1 || end === -1) return sound;
+
+  const padding = Math.round((paddingMs * sound.sampleRate) / 1000);
+  const trimmedStart = Math.max(0, start - padding);
+  const trimmedEnd = Math.min(sound.data.length, end + 1 + padding);
+
+  if (trimmedStart === 0 && trimmedEnd === sound.data.length) return sound;
+  return { sampleRate: sound.sampleRate, data: sound.data.slice(trimmedStart, trimmedEnd) };
+}
+
+function peakNormalize(sound: MonoSound, targetPeak = 0.98): MonoSound {
+  let peak = 0;
+  for (const value of sound.data) peak = Math.max(peak, Math.abs(value));
+  if (peak <= 1e-9) return sound;
+
+  const data = new Float32Array(sound.data.length);
+  const gain = targetPeak / peak;
+  for (let index = 0; index < sound.data.length; index += 1) {
+    data[index] = clampSample(sound.data[index] * gain);
+  }
+  return { sampleRate: sound.sampleRate, data };
+}
+
+function applyFade(sound: MonoSound, fadeMs: number): MonoSound {
+  if (fadeMs <= 0) return sound;
+  const data = new Float32Array(sound.data);
+  const fadeFrames = Math.min(Math.round((fadeMs * sound.sampleRate) / 1000), Math.floor(data.length / 2));
+  if (fadeFrames <= 0) return sound;
+
+  for (let index = 0; index < fadeFrames; index += 1) {
+    const fadeIn = index / Math.max(1, fadeFrames - 1);
+    const fadeOut = 1 - fadeIn;
+    data[index] *= fadeIn;
+    data[data.length - 1 - index] *= fadeOut;
+  }
+
+  return { sampleRate: sound.sampleRate, data };
+}
+
+function padOrTrim(sound: MonoSound, lengthSeconds: number, sampleRate: number): MonoSound {
+  if (lengthSeconds <= 0) return sound;
+  const current = resampleIfNeeded(sound, sampleRate);
+  const targetFrames = Math.max(0, Math.round(lengthSeconds * sampleRate));
+  if (current.data.length === targetFrames) return current;
+
+  const data = new Float32Array(targetFrames);
+  data.set(current.data.slice(0, targetFrames));
+  return { sampleRate, data };
+}
+
+function estimatePitch(sound: MonoSound): number | null {
+  const data = sound.data;
+  const sampleRate = sound.sampleRate;
+  const minFreq = 45;
+  const maxFreq = 1000;
+  const minLag = Math.floor(sampleRate / maxFreq);
+  const maxLag = Math.min(Math.floor(sampleRate / minFreq), data.length - 1);
+  const windowSize = Math.min(data.length, sampleRate);
+
+  if (windowSize < minLag * 2) return null;
+
+  let bestLag = 0;
+  let bestCorrelation = 0;
+  for (let lag = minLag; lag <= maxLag; lag += 1) {
+    let sum = 0;
+    let leftEnergy = 0;
+    let rightEnergy = 0;
+    for (let index = 0; index < windowSize - lag; index += 1) {
+      const left = data[index];
+      const right = data[index + lag];
+      sum += left * right;
+      leftEnergy += left * left;
+      rightEnergy += right * right;
+    }
+    const correlation = sum / Math.sqrt(leftEnergy * rightEnergy || 1);
+    if (correlation > bestCorrelation) {
+      bestCorrelation = correlation;
+      bestLag = lag;
+    }
+  }
+
+  if (bestLag <= 0 || bestCorrelation < 0.28) return null;
+  return sampleRate / bestLag;
+}
+
+function retuneSound(sound: MonoSound, targetFrequency: number): MonoSound {
+  const currentFrequency = estimatePitch(sound);
+  if (!currentFrequency || !Number.isFinite(currentFrequency)) return sound;
+
+  const ratio = targetFrequency / currentFrequency;
+  if (!Number.isFinite(ratio) || ratio <= 0 || Math.abs(Math.log2(ratio)) < 0.0001) {
+    return sound;
+  }
+
+  const targetLength = Math.max(1, Math.round(sound.data.length / ratio));
+  const data = new Float32Array(targetLength);
+
+  for (let index = 0; index < targetLength; index += 1) {
+    const sourceIndex = index * ratio;
+    const left = Math.floor(sourceIndex);
+    const right = Math.min(sound.data.length - 1, left + 1);
+    const amount = sourceIndex - left;
+    data[index] = sound.data[left] * (1 - amount) + sound.data[right] * amount;
+  }
+
+  return { sampleRate: sound.sampleRate, data };
+}
+
+function makeSilence(seconds: number, sampleRate: number): MonoSound {
+  return { sampleRate, data: new Float32Array(Math.max(0, Math.round(seconds * sampleRate))) };
+}
+
+function concatenateSounds(sounds: MonoSound[], sampleRate: number): MonoSound {
+  const rendered = sounds.map((sound) => resampleIfNeeded(sound, sampleRate));
+  const totalLength = rendered.reduce((sum, sound) => sum + sound.data.length, 0);
+  const data = new Float32Array(totalLength);
+  let offset = 0;
+
+  for (const sound of rendered) {
+    data.set(sound.data, offset);
+    offset += sound.data.length;
+  }
+
+  return { sampleRate, data };
+}
+
+function writeString(view: DataView, offset: number, value: string) {
+  for (let index = 0; index < value.length; index += 1) {
+    view.setUint8(offset + index, value.charCodeAt(index));
+  }
+}
+
+function chunk(id: string, body: Uint8Array) {
+  const pad = body.length % 2;
+  const output = new Uint8Array(8 + body.length + pad);
+  const view = new DataView(output.buffer);
+  writeString(view, 0, id);
+  view.setUint32(4, body.length, true);
+  output.set(body, 8);
+  return output;
+}
+
+function buildMarkerChunks(markers: SliceMarker[]) {
+  const cueBody = new Uint8Array(4 + markers.length * 24);
+  const cueView = new DataView(cueBody.buffer);
+  cueView.setUint32(0, markers.length, true);
+
+  let cueOffset = 4;
+  const labelChunks: Uint8Array[] = [];
+
+  markers.forEach((marker, index) => {
+    const cueId = index + 1;
+    const sampleOffset = Math.max(0, Math.floor(marker.offset));
+    cueView.setUint32(cueOffset, cueId, true);
+    cueView.setUint32(cueOffset + 4, sampleOffset, true);
+    writeString(cueView, cueOffset + 8, "data");
+    cueView.setUint32(cueOffset + 12, 0, true);
+    cueView.setUint32(cueOffset + 16, 0, true);
+    cueView.setUint32(cueOffset + 20, sampleOffset, true);
+    cueOffset += 24;
+
+    const encodedLabel = new TextEncoder().encode(marker.label);
+    const labelBody = new Uint8Array(4 + encodedLabel.length + 1);
+    const labelView = new DataView(labelBody.buffer);
+    labelView.setUint32(0, cueId, true);
+    labelBody.set(encodedLabel, 4);
+    labelChunks.push(chunk("labl", labelBody));
+  });
+
+  const listSize = 4 + labelChunks.reduce((sum, item) => sum + item.length, 0);
+  const listBody = new Uint8Array(listSize);
+  const listView = new DataView(listBody.buffer);
+  writeString(listView, 0, "adtl");
+  let offset = 4;
+  for (const labelChunk of labelChunks) {
+    listBody.set(labelChunk, offset);
+    offset += labelChunk.length;
+  }
+
+  return [chunk("cue ", cueBody), chunk("LIST", listBody)];
+}
+
+function encodeWav(sound: MonoSound, markers: SliceMarker[] = []) {
+  const sampleRate = sound.sampleRate;
+  const pcm = new Uint8Array(sound.data.length * 2);
+  const pcmView = new DataView(pcm.buffer);
+  for (let index = 0; index < sound.data.length; index += 1) {
+    const value = clampSample(sound.data[index]);
+    pcmView.setInt16(index * 2, value < 0 ? value * 0x8000 : value * 0x7fff, true);
+  }
+
+  const fmtBody = new Uint8Array(16);
+  const fmtView = new DataView(fmtBody.buffer);
+  fmtView.setUint16(0, 1, true);
+  fmtView.setUint16(2, 1, true);
+  fmtView.setUint32(4, sampleRate, true);
+  fmtView.setUint32(8, sampleRate * 2, true);
+  fmtView.setUint16(12, 2, true);
+  fmtView.setUint16(14, 16, true);
+
+  const chunks = [chunk("fmt ", fmtBody), chunk("data", pcm), ...buildMarkerChunks(markers)];
+  const riffSize = 4 + chunks.reduce((sum, item) => sum + item.length, 0);
+  const output = new Uint8Array(8 + riffSize);
+  const view = new DataView(output.buffer);
+  writeString(view, 0, "RIFF");
+  view.setUint32(4, riffSize, true);
+  writeString(view, 8, "WAVE");
+
+  let offset = 12;
+  for (const item of chunks) {
+    output.set(item, offset);
+    offset += item.length;
+  }
+
+  return new Blob([output], { type: "audio/wav" });
+}
+
+function formatBytes(bytes: number) {
+  if (bytes < 1024) return `${bytes} B`;
+  if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(1)} KB`;
+  return `${(bytes / (1024 * 1024)).toFixed(1)} MB`;
+}
+
+function App() {
+  const fileInputRef = useRef<HTMLInputElement>(null);
+  const [settings, setSettings] = useState<Settings>(initialSettings);
+  const [files, setFiles] = useState<File[]>([]);
+  const [logs, setLogs] = useState<string[]>([]);
+  const [isGenerating, setIsGenerating] = useState(false);
+  const [progress, setProgress] = useState({ done: 0, total: 0, label: "Idle" });
+  const [chromatic, setChromatic] = useState<GeneratedFile | null>(null);
+  const [dumpedSamples, setDumpedSamples] = useState<GeneratedFile[]>([]);
+  const [error, setError] = useState("");
+
+  const sourceFiles = useMemo(() => listSourceFiles(files), [files]);
+  const canGenerate = sourceFiles.length > 0 && !isGenerating;
+  const completion = progress.total > 0 ? Math.round((progress.done / progress.total) * 100) : 0;
+
+  function patchSettings(patch: Partial<Settings>) {
+    setSettings((current) => ({ ...current, ...patch }));
+  }
+
+  function handleFiles(event: ChangeEvent<HTMLInputElement>) {
+    const selected = Array.from(event.currentTarget.files ?? []);
+    setFiles(selected);
+    setError("");
+    setChromatic(null);
+    setDumpedSamples([]);
+    setLogs(selected.length ? [`Loaded ${selected.length} file(s).`] : []);
+  }
+
+  function clearOutput() {
+    if (chromatic) URL.revokeObjectURL(chromatic.url);
+    for (const sample of dumpedSamples) URL.revokeObjectURL(sample.url);
+    setChromatic(null);
+    setDumpedSamples([]);
+    setLogs([]);
+    setProgress({ done: 0, total: 0, label: "Idle" });
+    setError("");
+  }
+
+  async function generate() {
+    if (!canGenerate) return;
+
+    clearOutput();
+    setIsGenerating(true);
+    setProgress({ done: 0, total: settings.semitones, label: "Starting" });
+
+    try {
+      const addLog = (message: string) => setLogs((current) => [...current, message]);
+      addLog(`Found ${sourceFiles.length} source WAV file(s).`);
+      addLog(
+        `Semitones: ${settings.semitones} | Gap: ${settings.gapSeconds.toFixed(3)}s | ` +
+          `Order: ${settings.orderMode} | Output: ${settings.outputSampleRate} Hz`,
+      );
+      if (settings.pitchSamples) {
+        addLog("Pitch mode uses browser-side pitch estimation. Desktop ChromaKit still has the more exact Praat retune.");
+      }
+
+      const indexes = orderedSampleIndexes(sourceFiles.length, settings.semitones, settings.orderMode);
+      const renderedNotes: MonoSound[] = [];
+      const sampleDownloads: GeneratedFile[] = [];
+      const markers: SliceMarker[] = [];
+      let currentOffset = 0;
+      const gap = settings.gapSeconds > 0 ? makeSilence(settings.gapSeconds, settings.outputSampleRate) : null;
+
+      for (let offset = 0; offset < indexes.length; offset += 1) {
+        const file = sourceFiles[indexes[offset]];
+        const label = noteLabel(settings.startNoteIndex, settings.startOctave, offset);
+        addLog(`[${offset + 1}/${settings.semitones}] Loading ${file.name} -> ${label}`);
+
+        let sound = await decodeWav(file, DEFAULT_SAMPLE_RATE);
+        if (settings.trimSilence) {
+          sound = trimEdgeSilence(sound);
+          addLog("  trimmed silence");
+        }
+        if (settings.normalize) {
+          sound = peakNormalize(sound);
+          addLog("  normalized");
+        }
+        if (settings.pitchSamples) {
+          sound = retuneSound(sound, noteFrequency(settings.startNoteIndex, settings.startOctave, offset));
+          addLog("  pitched");
+        }
+        if (settings.fadeMs > 0) {
+          sound = applyFade(sound, settings.fadeMs);
+          addLog(`  fade ${settings.fadeMs} ms`);
+        }
+        if (settings.fixedNoteLength > 0) {
+          sound = padOrTrim(sound, settings.fixedNoteLength, DEFAULT_SAMPLE_RATE);
+          addLog(`  fixed length ${settings.fixedNoteLength.toFixed(3)}s`);
+        }
+
+        sound = resampleIfNeeded(sound, settings.outputSampleRate);
+        if (settings.slicexMarkers) markers.push({ offset: currentOffset, label });
+        renderedNotes.push(sound);
+        currentOffset += sound.data.length;
+
+        if (settings.dumpSamples) {
+          const blob = encodeWav(sound);
+          sampleDownloads.push({
+            name: `note_${offset + 1}_${label.replace("#", "sharp")}.wav`,
+            url: URL.createObjectURL(blob),
+            size: blob.size,
+          });
+        }
+
+        if (gap && offset < indexes.length - 1) {
+          renderedNotes.push(gap);
+          currentOffset += gap.data.length;
+        }
+
+        setProgress({ done: offset + 1, total: settings.semitones, label });
+        await new Promise((resolve) => window.setTimeout(resolve, 0));
+      }
+
+      const output = concatenateSounds(renderedNotes, settings.outputSampleRate);
+      const blob = encodeWav(output, settings.slicexMarkers ? markers : []);
+      setChromatic({ name: "chromatic.wav", url: URL.createObjectURL(blob), size: blob.size });
+      setDumpedSamples(sampleDownloads);
+      addLog("Saved: chromatic.wav");
+      setProgress({ done: settings.semitones, total: settings.semitones, label: "Done" });
+    } catch (caught) {
+      const message = caught instanceof Error ? caught.message : "Generation failed.";
+      setError(message);
+      setLogs((current) => [...current, `Error: ${message}`]);
+    } finally {
+      setIsGenerating(false);
+    }
+  }
+
+  return (
+    <main className="app-shell">
+      <section className="hero-band">
+        <div className="hero-copy">
+          <img src="/chromakit-logo.png" alt="ChromaKit" className="brand-logo" />
+          <h1>ChromaKit Web</h1>
+          <p>
+            Generate chromatic WAV scales from browser-selected samples. No install, no upload server, just local audio
+            processing and an instant download.
+          </p>
+        </div>
+        <div className="hero-meter" aria-label="Generation progress">
+          <div className="meter-header">
+            <Gauge size={18} />
+            <span>{progress.label}</span>
+          </div>
+          <div className="meter-value">{completion}%</div>
+          <div className="progress-track">
+            <span style={{ width: `${completion}%` }} />
+          </div>
+        </div>
+      </section>
+
+      <section className="workspace" aria-label="Generate chromatic scale">
+        <aside className="panel source-panel">
+          <div className="panel-title">
+            <Upload size={18} />
+            <h2>Source WAVs</h2>
+          </div>
+
+          <button className="drop-zone" type="button" onClick={() => fileInputRef.current?.click()}>
+            <FileAudio size={28} />
+            <span>Choose WAV files</span>
+            <small>Numbered files like 1.wav, 2.wav are used first.</small>
+          </button>
+          <input ref={fileInputRef} className="visually-hidden" type="file" accept=".wav,audio/wav" multiple onChange={handleFiles} />
+
+          <div className="source-summary">
+            <strong>{sourceFiles.length}</strong>
+            <span>usable WAV file{sourceFiles.length === 1 ? "" : "s"}</span>
+          </div>
+
+          <div className="file-list" aria-label="Selected source files">
+            {sourceFiles.length === 0 ? (
+              <p className="empty-state">No WAV files selected yet.</p>
+            ) : (
+              sourceFiles.slice(0, 12).map((file) => (
+                <div className="file-row" key={`${file.name}-${file.size}`}>
+                  <Music2 size={16} />
+                  <span>{file.name}</span>
+                  <small>{formatBytes(file.size)}</small>
+                </div>
+              ))
+            )}
+            {sourceFiles.length > 12 ? <p className="overflow-note">+{sourceFiles.length - 12} more files</p> : null}
+          </div>
+        </aside>
+
+        <section className="panel controls-panel">
+          <div className="panel-title">
+            <SlidersHorizontal size={18} />
+            <h2>Generate</h2>
+          </div>
+
+          <div className="control-grid">
+            <label>
+              <span>Start note</span>
+              <select value={settings.startNoteIndex} onChange={(event) => patchSettings({ startNoteIndex: Number(event.target.value) })}>
+                {NOTES.map((note, index) => (
+                  <option key={note} value={index}>
+                    {note}
+                  </option>
+                ))}
+              </select>
+            </label>
+
+            <label>
+              <span>Octave</span>
+              <select value={settings.startOctave} onChange={(event) => patchSettings({ startOctave: Number(event.target.value) })}>
+                {OCTAVES.map((octave) => (
+                  <option key={octave} value={octave}>
+                    {octave}
+                  </option>
+                ))}
+              </select>
+            </label>
+
+            <label>
+              <span>Range</span>
+              <input
+                type="number"
+                min={1}
+                max={128}
+                value={settings.semitones}
+                onChange={(event) => patchSettings({ semitones: Math.max(1, Math.min(128, Number(event.target.value))) })}
+              />
+            </label>
+
+            <label>
+              <span>Gap seconds</span>
+              <input
+                type="number"
+                min={0}
+                step={0.01}
+                value={settings.gapSeconds}
+                onChange={(event) => patchSettings({ gapSeconds: Math.max(0, Number(event.target.value)) })}
+              />
+            </label>
+
+            <label>
+              <span>Order</span>
+              <select value={settings.orderMode} onChange={(event) => patchSettings({ orderMode: event.target.value as OrderMode })}>
+                {ORDER_MODES.map((mode) => (
+                  <option key={mode} value={mode}>
+                    {mode}
+                  </option>
+                ))}
+              </select>
+            </label>
+
+            <label>
+              <span>Output rate</span>
+              <select value={settings.outputSampleRate} onChange={(event) => patchSettings({ outputSampleRate: Number(event.target.value) })}>
+                {SAMPLE_RATES.map((rate) => (
+                  <option key={rate} value={rate}>
+                    {rate} Hz
+                  </option>
+                ))}
+              </select>
+            </label>
+
+            <label>
+              <span>Fade ms</span>
+              <input
+                type="number"
+                min={0}
+                value={settings.fadeMs}
+                onChange={(event) => patchSettings({ fadeMs: Math.max(0, Number(event.target.value)) })}
+              />
+            </label>
+
+            <label>
+              <span>Fixed length</span>
+              <input
+                type="number"
+                min={0}
+                step={0.05}
+                value={settings.fixedNoteLength}
+                onChange={(event) => patchSettings({ fixedNoteLength: Math.max(0, Number(event.target.value)) })}
+              />
+            </label>
+          </div>
+
+          <div className="toggle-grid">
+            <Toggle label="Pitch samples" checked={settings.pitchSamples} onChange={(pitchSamples) => patchSettings({ pitchSamples })} />
+            <Toggle label="Dump samples" checked={settings.dumpSamples} onChange={(dumpSamples) => patchSettings({ dumpSamples })} />
+            <Toggle label="Trim silence" checked={settings.trimSilence} onChange={(trimSilence) => patchSettings({ trimSilence })} />
+            <Toggle label="Normalize" checked={settings.normalize} onChange={(normalize) => patchSettings({ normalize })} />
+            <Toggle label="SliceX markers" checked={settings.slicexMarkers} onChange={(slicexMarkers) => patchSettings({ slicexMarkers })} />
+          </div>
+
+          <div className="action-row">
+            <button className="primary-button" type="button" disabled={!canGenerate} onClick={generate}>
+              {isGenerating ? <Loader2 className="spin" size={18} /> : <Sparkles size={18} />}
+              Generate Chromatic
+            </button>
+            <button className="secondary-button" type="button" onClick={clearOutput} disabled={isGenerating}>
+              <RefreshCcw size={18} />
+              Reset Output
+            </button>
+          </div>
+
+          {error ? (
+            <div className="error-box" role="alert">
+              <X size={18} />
+              {error}
+            </div>
+          ) : null}
+        </section>
+
+        <aside className="panel output-panel">
+          <div className="panel-title">
+            <AudioLines size={18} />
+            <h2>Output</h2>
+          </div>
+
+          <div className="status-box">
+            <Info size={18} />
+            <span>Browser pitch is approximate. Use desktop ChromaKit when exact Praat retuning is required.</span>
+          </div>
+
+          {chromatic ? (
+            <a className="download-card" href={chromatic.url} download={chromatic.name}>
+              <Download size={20} />
+              <span>
+                <strong>{chromatic.name}</strong>
+                <small>{formatBytes(chromatic.size)}</small>
+              </span>
+            </a>
+          ) : (
+            <div className="empty-output">
+              <Check size={18} />
+              <span>Generated files will appear here.</span>
+            </div>
+          )}
+
+          {dumpedSamples.length > 0 ? (
+            <div className="sample-downloads">
+              <h3>Dumped samples</h3>
+              {dumpedSamples.map((sample) => (
+                <a key={sample.name} href={sample.url} download={sample.name}>
+                  {sample.name}
+                  <small>{formatBytes(sample.size)}</small>
+                </a>
+              ))}
+            </div>
+          ) : null}
+
+          <div className="log-box" aria-live="polite">
+            {logs.length === 0 ? <p>Logs will appear here.</p> : logs.map((log, index) => <p key={`${log}-${index}`}>{log}</p>)}
+          </div>
+        </aside>
+      </section>
+    </main>
+  );
+}
+
+type ToggleProps = {
+  label: string;
+  checked: boolean;
+  onChange: (checked: boolean) => void;
+};
+
+function Toggle({ label, checked, onChange }: ToggleProps) {
+  return (
+    <label className="toggle">
+      <input type="checkbox" checked={checked} onChange={(event) => onChange(event.target.checked)} />
+      <span className="switch" aria-hidden="true" />
+      <span>{label}</span>
+    </label>
+  );
+}
+
+export default App;
